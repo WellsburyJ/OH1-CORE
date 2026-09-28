@@ -9,7 +9,7 @@ static const unsigned long STREAM_MS = 100;
 static const int NUM_MOTORS = 5;
 static const int POLE_PAIRS = 11;            // GMT4108 / GM4108H 24N22P
 static const float PHASE_RESISTANCE = 5.55f; // GM4108H-120T 11.1Ω L-L → ~5.55Ω per phase (star)
-static const float MOTOR_KV = 55.0f;         // ~1100 rpm @ 20 V
+static const float MOTOR_KV = 32.0f;         // datasheet 513-567 rpm @ 20 V no-load
 
 // ---------- Motor PWM + enable ----------
 // Motor#  Driver  Ref   IN1/2/3          EN     Connector
@@ -41,22 +41,34 @@ static const int I2C_HOST_SCL = 2;
 static uint8_t muxAddr = 0x70;
 static const int MUX_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3, 4};
 
-// Mechanical mounting: these motors are fitted reversed, so +fwd and rising
-// angle must both flip for them. Combined with the FOC sensor_direction in
-// commandSign(), "fwd" always increases the reported angle on every motor.
-static const bool MOTOR_INVERT[NUM_MOTORS] = {false, true, false, true, true};
+// Mechanical mounting: these motors are fitted reversed, so reported angles
+// (and the base command frame) flip for them. Combined with FOC sensor_direction
+// in commandSign(), "fwd" should increase the reported angle on every motor.
+// M2/M4: angle frame is native (MOTOR_INVERT off); command polarity matched via
+// leaving MOTOR_CMD_FLIP off so fwd/rev stay correct after undoing the angle flip.
+static const bool MOTOR_INVERT[NUM_MOTORS] = {false, false, false, false, true};
+
+// Extra fwd/rev polarity (angles unchanged). Unused for M2/M4 after angle fix above.
+static const bool MOTOR_CMD_FLIP[NUM_MOTORS] = {false, false, false, false, false};
 
 // ---------- Limits ----------
 static const float DRIVER_BUS_VOLTAGE = 12.0f;
 static const float OPENLOOP_VOLTAGE_LIMIT = 1.5f;  // fallback only, stalls over-current if raised
-static const float CLOSED_LOOP_VOLTAGE_LIMIT = 6.0f;
-static const float MOTOR_CURRENT_LIMIT = 0.6f;     // amps (estimated from phase resistance)
+// SVPWM on a 12 V bus allows ~6.93 V peak Uq (SinePWM was ~6.0 V).
+static const float CLOSED_LOOP_VOLTAGE_LIMIT = 6.9f;
+// 6.9 V across 5.55 Ω winding + 0.48 Ω driver RDS(on) stalls at ~1.14 A, so the
+// bus clamps motion current before this limit does. Not a continuous rating:
+// ~11 W at stall against ~4 W free-air, so keep moves short (see MAX_ENERGISE_MS).
+static const float MOTOR_CURRENT_LIMIT = 1.25f;     // motion / torque (estimated from phase resistance)
+static const float MOTOR_HOLD_CURRENT_LIMIT = 0.4f; // indefinite hold — ~1.3 W, safe unattended
 static const float ALIGN_VOLTAGE = 4.0f;
 static const float DEMO_SPEED = 2.0f;              // rad/s
 static const float MAX_VELOCITY = 3.0f;            // rad/s
 static const unsigned long DEMO_MOVE_MS = 2000;
 static const float MIN_TRAVEL_RAD = 0.05f;         // reject tiny min/max span
-static const unsigned long MAX_ENERGISE_MS = 30000;
+// Thermal backstop. Must stay above POSITION_TIMEOUT_MS so a legitimate slow
+// move is not cut short by it.
+static const unsigned long MAX_ENERGISE_MS = 15000;
 static const unsigned long POSITION_TIMEOUT_MS = 10000;
 static const unsigned long TORQUE_TIMEOUT_MS = 10000;
 static const float POSITION_TOLERANCE_RAD = 0.02f;
@@ -240,6 +252,7 @@ float motorAngle(int i) {
 float commandSign(int i) {
   float s = MOTOR_INVERT[i] ? -1.0f : 1.0f;
   if (motors[i].sensor_direction == Direction::CCW) s = -s;
+  if (MOTOR_CMD_FLIP[i]) s = -s;
   return s;
 }
 
@@ -560,6 +573,24 @@ void setEndAll(bool asMax) {
   }
 }
 
+// Drop stored min/max (same as a power cycle for that motor). Soft endstops
+// and goto stay off until both ends are marked again.
+void clearCal(int i) {
+  if (i < 0 || i >= NUM_MOTORS) return;
+  haveMin[i] = false;
+  haveMax[i] = false;
+  angleMin[i] = 0;
+  angleMax[i] = 0;
+  calibrated[i] = false;
+  Serial.print("M");
+  Serial.print(i + 1);
+  Serial.println(" cal cleared");
+}
+
+void clearCalAll() {
+  for (int i = 0; i < NUM_MOTORS; i++) clearCal(i);
+}
+
 // ---------- Motion commands (non-blocking) ----------
 void traceStart(int i) {
   traceActive[i] = true;
@@ -626,6 +657,7 @@ void startVelocity(int i, float logicalVel, unsigned long durationMs) {
   motors[i].controller = focReady[i] ? MotionControlType::velocity
                                      : MotionControlType::velocity_openloop;
   if (!focReady[i]) motors[i].voltage_limit = OPENLOOP_VOLTAGE_LIMIT;
+  else motors[i].updateCurrentLimit(MOTOR_CURRENT_LIMIT);
   motors[i].PID_velocity.reset();
 
   ctrlMode[i] = CTRL_VELOCITY;
@@ -660,6 +692,8 @@ void startPosition(int i, float logicalAngle, bool hold) {
   motors[i].controller = MotionControlType::angle;
   motors[i].PID_velocity.reset();
   motors[i].P_angle.reset();
+  // Indefinite hold uses a lower current ceiling to limit continuous heating.
+  motors[i].updateCurrentLimit(hold ? MOTOR_HOLD_CURRENT_LIMIT : MOTOR_CURRENT_LIMIT);
 
   ctrlMode[i] = CTRL_POSITION;
   ctrlTarget[i] = logicalAngle;
@@ -675,7 +709,13 @@ void startPosition(int i, float logicalAngle, bool hold) {
   Serial.print(" target=");
   Serial.print(logicalAngle * 180.0f / PI, 1);
   Serial.print("deg from=");
-  Serial.println(motorAngle(i) * 180.0f / PI, 1);
+  Serial.print(motorAngle(i) * 180.0f / PI, 1);
+  if (hold) {
+    Serial.print(" Ihold=");
+    Serial.print(MOTOR_HOLD_CURRENT_LIMIT, 2);
+    Serial.print("A");
+  }
+  Serial.println();
 }
 
 void startTorque(int i, float amps) {
@@ -689,6 +729,7 @@ void startTorque(int i, float amps) {
   amps = _constrain(amps, -MOTOR_CURRENT_LIMIT, MOTOR_CURRENT_LIMIT);
 
   motors[i].controller = MotionControlType::torque;
+  motors[i].updateCurrentLimit(MOTOR_CURRENT_LIMIT);
   motors[i].PID_velocity.reset();
 
   ctrlMode[i] = CTRL_TORQUE;
@@ -826,6 +867,7 @@ void serviceDemo() {
 
 // ---------- Init ----------
 void applyClosedLoopTuning(int i) {
+  motors[i].foc_modulation = FOCModulationType::SpaceVectorPWM;
   motors[i].voltage_limit = CLOSED_LOOP_VOLTAGE_LIMIT;
   motors[i].updateTorqueControlType(TorqueControlType::estimated_current);
   motors[i].updateCurrentLimit(MOTOR_CURRENT_LIMIT);
@@ -903,6 +945,8 @@ void disableAllEnPinsEarly() {
 }
 
 // ---------- Telemetry ----------
+// values angles keeps streaming during fwd/rev: active motors already refresh
+// continuousAngle in serviceMotors(); idle motors are re-read here.
 void streamTelemetry() {
   unsigned long ts = millis();
 
@@ -917,6 +961,9 @@ void streamTelemetry() {
         sensorOk[i] = true;
         updateContinuousAngle(i);
       }
+    } else if (sensorOk[i] && focReady[i]) {
+      // Belt-and-suspenders: FOC path updated the sensor; keep continuousAngle in sync
+      continuousAngle[i] = focSensors[i].getAngle();
     }
     if (!sensorOk[i]) {
       motorsLine += "nan,";
@@ -981,6 +1028,26 @@ void printStatus() {
   }
 }
 
+// Stored endpoints in encoder degrees (same frame as values angles). Unset → nan.
+// Emitted on Serial and BLE notify (not gated by txValues).
+void replyMinMax() {
+  String line = "minmax ";
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    if (i) line += ",";
+    if (haveMin[i]) line += String(angleMin[i] * 180.0f / PI, 1);
+    else line += "nan";
+    line += ",";
+    if (haveMax[i]) line += String(angleMax[i] * 180.0f / PI, 1);
+    else line += "nan";
+  }
+  line += "\n";
+  Serial.print(line);
+  if (deviceConnected && pTxCharacteristic != nullptr) {
+    pTxCharacteristic->setValue(line.c_str());
+    pTxCharacteristic->notify();
+  }
+}
+
 void printHelp() {
   Serial.println("Commands:");
   Serial.println("  min | max          mark current pose as min/max (all motors)");
@@ -997,10 +1064,13 @@ void printHelp() {
   Serial.println("  status | focdebug on|off");
   Serial.println("  start | stop       enable/disable values stream");
   Serial.println("  get version");
+  Serial.println("  get minmax         stored ends deg M1..M5 min,max (nan if unset)");
+  Serial.println("  cal clear | cal clear N   forget min/max (all or motor N)");
   Serial.println("  sensors | muxscan | help");
   Serial.println("  demo               each calibrated motor: goto min, then max");
   Serial.println("  imu reset          reset Madgwick orientation filter");
-  Serial.println("  (values quat / values linaccel / values flex stream when start is active)");
+  Serial.println("  (values motors / angles / quat / linaccel / flex when start is active)");
+  Serial.println("  Calib is RAM-only (lost on reset). Device order: M1=Pinky .. M5=Thumb");
 }
 
 // ---------- Command parsing ----------
@@ -1169,6 +1239,14 @@ void handleCommand(String cmd) {
       pTxCharacteristic->setValue(v.c_str());
       pTxCharacteristic->notify();
     }
+  } else if (cmd == "get minmax" || cmd.startsWith("get minmax")) {
+    replyMinMax();
+  } else if (cmd == "cal clear") {
+    clearCalAll();
+  } else if (cmd.startsWith("cal clear ")) {
+    int n = motorArg(cmd, 10);
+    if (n >= 1 && n <= NUM_MOTORS) clearCal(n - 1);
+    else Serial.println("Usage: cal clear  or  cal clear N");
   } else if (cmd == "sensors") {
     printAllSensors();
   } else if (cmd == "muxscan") {
@@ -1202,6 +1280,10 @@ void setup() {
   Serial.println("OH1-CORE v1.0 — 5-motor GMT4108");
   Serial.print("version:");
   Serial.println(FIRMWARE_VERSION);
+
+  // Surfaces the estimated pole pairs behind a pp_check failure, and which
+  // motors share an MCPWM timer.
+  SimpleFOCDebug::enable(&Serial);
 
   char BLName[] = "OMNIHUMAN-O1";
   startBle(BLName);
@@ -1260,9 +1342,10 @@ void setup() {
   printAllSensors();
   printStatus();
   printHelp();
-  Serial.println("Move each rail to an end, then send min or max");
+  Serial.println("Move each rail to an end, then send min or max (RAM-only until reset)");
   Serial.println("Streaming values motors / values angles (start|stop to gate)");
   Serial.println("RS485 glove on GPIO44 RX — values quat / values linaccel / values flex when streaming");
+  Serial.println("Device motors: M1=Pinky M2=Ring M3=Middle M4=Index M5=Thumb");
 }
 
 void loop() {
