@@ -41,14 +41,12 @@ static const int I2C_HOST_SCL = 2;
 static uint8_t muxAddr = 0x70;
 static const int MUX_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3, 4};
 
-// Mechanical mounting: these motors are fitted reversed, so reported angles
-// (and the base command frame) flip for them. Combined with FOC sensor_direction
+// Mechanical mounting: set true for a motor fitted reversed, so its reported
+// angle (and the base command frame) flip. Combined with FOC sensor_direction
 // in commandSign(), "fwd" should increase the reported angle on every motor.
-// M2/M4: angle frame is native (MOTOR_INVERT off); command polarity matched via
-// leaving MOTOR_CMD_FLIP off so fwd/rev stay correct after undoing the angle flip.
-static const bool MOTOR_INVERT[NUM_MOTORS] = {false, false, false, false, true};
+static const bool MOTOR_INVERT[NUM_MOTORS] = {false, false, false, false, false};
 
-// Extra fwd/rev polarity (angles unchanged). Unused for M2/M4 after angle fix above.
+// Extra fwd/rev polarity (angles unchanged).
 static const bool MOTOR_CMD_FLIP[NUM_MOTORS] = {false, false, false, false, false};
 
 // ---------- Limits ----------
