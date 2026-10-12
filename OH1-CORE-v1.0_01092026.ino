@@ -60,8 +60,20 @@ static const float CLOSED_LOOP_VOLTAGE_LIMIT = 6.9f;
 static const float MOTOR_CURRENT_LIMIT = 1.25f;     // motion / torque (estimated from phase resistance)
 static const float MOTOR_HOLD_CURRENT_LIMIT = 0.4f; // indefinite hold — ~1.3 W, safe unattended
 static const float ALIGN_VOLTAGE = 4.0f;
-static const float DEMO_SPEED = 2.0f;              // rad/s
-static const float MAX_VELOCITY = 3.0f;            // rad/s
+static const float DEMO_SPEED = 2.0f;              // rad/s — default fwd/rev jog speed
+static const float MAX_VELOCITY = 3.0f;            // rad/s — default goto speed, and hold recovery
+// Range for the optional speed argument on goto / fwd / rev. Above ~10 rad/s
+// back-EMF leaves under ~80% of the available torque on a 12 V bus.
+static const float MIN_USER_SPEED = 0.1f;          // rad/s
+static const float MAX_USER_SPEED = 10.0f;         // rad/s
+// goto follows a moving reference (trapezoidal profile) instead of stepping the
+// target, with the profile velocity fed forward so feedback only trims error.
+static const float POS_ACCEL = 20.0f;              // rad/s^2
+// Velocity limit above the profile speed, leaving the angle loop room to correct.
+static const float POS_SPEED_HEADROOM = 1.0f;      // rad/s
+// Max distance a jog reference may run ahead of the shaft. Without it a blocked
+// finger lets the reference run away and the motor lunges when released.
+static const float JOG_MAX_LEAD_RAD = 0.3f;
 static const unsigned long DEMO_MOVE_MS = 2000;
 static const float MIN_TRAVEL_RAD = 0.05f;         // reject tiny min/max span
 // Thermal backstop. Must stay above POSITION_TIMEOUT_MS so a legitimate slow
@@ -227,6 +239,12 @@ float ctrlTarget[NUM_MOTORS] = {};        // logical frame: rad/s, rad, or amps
 unsigned long ctrlEndMs[NUM_MOTORS] = {}; // 0 = run indefinitely
 bool ctrlHold[NUM_MOTORS] = {};
 unsigned long posInToleranceMs[NUM_MOTORS] = {};
+
+// goto motion profile, logical frame
+float posRef[NUM_MOTORS] = {};       // reference angle the loop follows, rad
+float posRefVel[NUM_MOTORS] = {};    // reference velocity, rad/s
+float posSpeed[NUM_MOTORS] = {};     // cruise speed for this move, rad/s
+unsigned long posRefUs[NUM_MOTORS] = {};
 
 bool traceActive[NUM_MOTORS] = {};
 unsigned long nextTraceMs[NUM_MOTORS] = {};
@@ -409,8 +427,10 @@ void stopMotor(int i, const char *why) {
     motors[i].PID_velocity.reset();
     motors[i].P_angle.reset();
     motors[i].target = 0;
+    motors[i].feed_forward_velocity = 0;
     motorCoast(i);
   }
+  posRefVel[i] = 0;
   if (wasActive && traceActive[i]) {
     Serial.print("M");
     Serial.print(i + 1);
@@ -618,6 +638,59 @@ void traceMotor(int i) {
   Serial.println();
 }
 
+// Advances posRef toward ctrlTarget: accelerate to posSpeed, cruise, then
+// decelerate so the reference arrives at the target with zero velocity.
+void stepPositionProfile(int i) {
+  unsigned long now = micros();
+  float dt = (now - posRefUs[i]) * 1e-6f;
+  posRefUs[i] = now;
+  if (dt > 0.02f) dt = 0.02f;  // don't jump the reference after a long loop stall
+
+  float remaining = ctrlTarget[i] - posRef[i];
+  float dir = remaining >= 0 ? 1.0f : -1.0f;
+  float dist = fabsf(remaining);
+  float v = posRefVel[i] * dir;
+  float vTarget = fminf(posSpeed[i], sqrtf(2.0f * POS_ACCEL * dist));
+  if (v < vTarget) v = fminf(v + POS_ACCEL * dt, vTarget);
+  else v = fmaxf(v - POS_ACCEL * dt, vTarget);
+
+  float step = v * dt;
+  if (step >= dist) {
+    posRef[i] = ctrlTarget[i];
+    posRefVel[i] = 0;
+    return;
+  }
+  posRef[i] += dir * step;
+  posRefVel[i] = dir * v;
+}
+
+// Advances posRef at the jog velocity (ctrlTarget), ramping at POS_ACCEL.
+void stepJogReference(int i) {
+  unsigned long now = micros();
+  float dt = (now - posRefUs[i]) * 1e-6f;
+  posRefUs[i] = now;
+  if (dt > 0.02f) dt = 0.02f;
+
+  float vTarget = ctrlTarget[i];
+  float v = posRefVel[i];
+  if (v < vTarget) v = fminf(v + POS_ACCEL * dt, vTarget);
+  else v = fmaxf(v - POS_ACCEL * dt, vTarget);
+  posRefVel[i] = v;
+
+  float actual = motorAngle(i);
+  posRef[i] = _constrain(posRef[i] + v * dt, actual - JOG_MAX_LEAD_RAD, actual + JOG_MAX_LEAD_RAD);
+}
+
+float clampSpeed(float s) {
+  float c = _constrain(s, MIN_USER_SPEED, MAX_USER_SPEED);
+  if (c != s) {
+    Serial.print("  speed clamped to ");
+    Serial.print(c, 2);
+    Serial.println("rad/s");
+  }
+  return c;
+}
+
 bool prepareMotion(int i) {
   if (i < 0 || i >= NUM_MOTORS) return false;
   if (!motorReady[i]) {
@@ -652,10 +725,23 @@ void startVelocity(int i, float logicalVel, unsigned long durationMs) {
     }
   }
 
-  motors[i].controller = focReady[i] ? MotionControlType::velocity
-                                     : MotionControlType::velocity_openloop;
-  if (!focReady[i]) motors[i].voltage_limit = OPENLOOP_VOLTAGE_LIMIT;
-  else motors[i].updateCurrentLimit(MOTOR_CURRENT_LIMIT);
+  if (focReady[i]) {
+    // Closed-loop jogs track a moving angle reference (see stepJogReference)
+    // rather than running velocity mode, whose feedback is the noisy
+    // differentiated encoder angle.
+    updateContinuousAngle(i);
+    motors[i].controller = MotionControlType::angle;
+    motors[i].updateCurrentLimit(MOTOR_CURRENT_LIMIT);
+    motors[i].updateVelocityLimit(fabsf(logicalVel) + POS_SPEED_HEADROOM);
+    motors[i].feed_forward_velocity = 0;
+    motors[i].P_angle.reset();
+    posRef[i] = motorAngle(i);
+    posRefVel[i] = 0;
+    posRefUs[i] = micros();
+  } else {
+    motors[i].controller = MotionControlType::velocity_openloop;
+    motors[i].voltage_limit = OPENLOOP_VOLTAGE_LIMIT;
+  }
   motors[i].PID_velocity.reset();
 
   ctrlMode[i] = CTRL_VELOCITY;
@@ -674,7 +760,7 @@ void startVelocity(int i, float logicalVel, unsigned long durationMs) {
   Serial.println(motorAngle(i) * 180.0f / PI, 1);
 }
 
-void startPosition(int i, float logicalAngle, bool hold) {
+void startPosition(int i, float logicalAngle, bool hold, float speed) {
   if (!prepareMotion(i)) return;
   if (!focReady[i]) {
     Serial.print("M");
@@ -692,11 +778,30 @@ void startPosition(int i, float logicalAngle, bool hold) {
   motors[i].P_angle.reset();
   // Indefinite hold uses a lower current ceiling to limit continuous heating.
   motors[i].updateCurrentLimit(hold ? MOTOR_HOLD_CURRENT_LIMIT : MOTOR_CURRENT_LIMIT);
+  // Hold keeps full recovery speed so a slow goto never leaves it soft.
+  if (hold) speed = MAX_VELOCITY;
+  motors[i].updateVelocityLimit(hold ? speed : speed + POS_SPEED_HEADROOM);
+  motors[i].feed_forward_velocity = 0;
+
+  // Hold targets the current angle, so it needs no profile.
+  posRef[i] = hold ? logicalAngle : motorAngle(i);
+  posRefVel[i] = 0;
+  posSpeed[i] = speed;
+  posRefUs[i] = micros();
 
   ctrlMode[i] = CTRL_POSITION;
   ctrlTarget[i] = logicalAngle;
   ctrlHold[i] = hold;
-  ctrlEndMs[i] = hold ? 0 : millis() + POSITION_TIMEOUT_MS;
+  if (hold) {
+    ctrlEndMs[i] = 0;
+  } else {
+    // Long slow moves would otherwise hit the fixed timeout before arriving.
+    float travel = fabsf(logicalAngle - motorAngle(i));
+    unsigned long expectMs = (unsigned long)((travel / speed + speed / POS_ACCEL) * 1000.0f) + 2000;
+    unsigned long timeoutMs = expectMs > POSITION_TIMEOUT_MS ? expectMs : POSITION_TIMEOUT_MS;
+    if (timeoutMs > MAX_ENERGISE_MS - 500) timeoutMs = MAX_ENERGISE_MS - 500;
+    ctrlEndMs[i] = millis() + timeoutMs;
+  }
   posInToleranceMs[i] = 0;
 
   motorEnable(i);
@@ -708,6 +813,9 @@ void startPosition(int i, float logicalAngle, bool hold) {
   Serial.print(logicalAngle * 180.0f / PI, 1);
   Serial.print("deg from=");
   Serial.print(motorAngle(i) * 180.0f / PI, 1);
+  Serial.print(" speed=");
+  Serial.print(speed, 2);
+  Serial.print("rad/s");
   if (hold) {
     Serial.print(" Ihold=");
     Serial.print(MOTOR_HOLD_CURRENT_LIMIT, 2);
@@ -778,7 +886,13 @@ void serviceMotors() {
           if (ctrlTarget[i] > 0 && pos >= 0.98f) reachedEnd = true;
           if (ctrlTarget[i] < 0 && pos <= 0.02f) reachedEnd = true;
         }
-        shaftTarget = sign * ctrlTarget[i];
+        if (focReady[i]) {
+          stepJogReference(i);
+          shaftTarget = sign * posRef[i];
+          motors[i].feed_forward_velocity = sign * posRefVel[i];
+        } else {
+          shaftTarget = sign * ctrlTarget[i];
+        }
         break;
       }
       case CTRL_POSITION: {
@@ -792,7 +906,9 @@ void serviceMotors() {
         } else {
           posInToleranceMs[i] = 0;
         }
-        shaftTarget = sign * ctrlTarget[i];
+        stepPositionProfile(i);
+        shaftTarget = sign * posRef[i];
+        motors[i].feed_forward_velocity = sign * posRefVel[i];
         break;
       }
       case CTRL_TORQUE:
@@ -849,7 +965,7 @@ void serviceDemo() {
       Serial.print("demo M");
       Serial.print(m + 1);
       Serial.println(toMax ? " -> max" : " -> min");
-      startPosition(m, target, false);
+      startPosition(m, target, false, MAX_VELOCITY);
       demoStepStarted = true;
       return;
     }
@@ -1050,8 +1166,9 @@ void printHelp() {
   Serial.println("Commands:");
   Serial.println("  min | max          mark current pose as min/max (all motors)");
   Serial.println("  min N | max N      same for motor N (1..5)");
-  Serial.println("  fwd N [s] | rev N [s]   velocity jog (default 2s)");
-  Serial.println("  goto N <0..1>      move to calibrated position");
+  Serial.println("  fwd N [s] [spd] | rev N [s] [spd]   velocity jog (default 2s @ 2 rad/s)");
+  Serial.println("  goto N <0..1> [spd]   move to calibrated position (default 3 rad/s)");
+  Serial.println("                     spd = rad/s, clamped 0.1..10");
   Serial.println("  hold N             hold current angle indefinitely");
   Serial.println("  torque N <amps>    torque command (+/-)");
   Serial.println("  idle N | idle      stop motion, coast");
@@ -1074,6 +1191,20 @@ void printHelp() {
 // ---------- Command parsing ----------
 int motorArg(const String &cmd, int fromIndex) {
   return cmd.substring(fromIndex).toInt();
+}
+
+// Returns the idx-th whitespace-separated token of args, or "" if absent.
+String argToken(const String &args, int idx) {
+  int len = args.length();
+  int pos = 0;
+  for (int t = 0; ; t++) {
+    while (pos < len && args[pos] == ' ') pos++;
+    if (pos >= len) return "";
+    int end = pos;
+    while (end < len && args[end] != ' ') end++;
+    if (t == idx) return args.substring(pos, end);
+    pos = end;
+  }
 }
 
 void handleCommand(String cmd) {
@@ -1099,40 +1230,41 @@ void handleCommand(String cmd) {
   } else if (cmd.startsWith("fwd ") || cmd.startsWith("rev ")) {
     bool forward = cmd.startsWith("fwd ");
     String args = cmd.substring(4);
-    args.trim();
-    int sp = args.indexOf(' ');
-    int n = (sp < 0 ? args : args.substring(0, sp)).toInt();
-    float secs = (sp < 0) ? 0.0f : args.substring(sp + 1).toFloat();
+    int n = argToken(args, 0).toInt();
+    float secs = argToken(args, 1).toFloat();
+    float speed = argToken(args, 2).toFloat();
     unsigned long durMs = (secs > 0.05f) ? (unsigned long)(secs * 1000.0f) : DEMO_MOVE_MS;
+    speed = (speed > 0.0f) ? clampSpeed(speed) : DEMO_SPEED;
     if (n >= 1 && n <= NUM_MOTORS) {
-      startVelocity(n - 1, forward ? +DEMO_SPEED : -DEMO_SPEED, durMs);
+      startVelocity(n - 1, forward ? +speed : -speed, durMs);
     } else {
-      Serial.println("Usage: fwd N [seconds]");
+      Serial.println("Usage: fwd N [seconds] [speed rad/s]");
     }
   } else if (cmd.startsWith("goto ")) {
     String args = cmd.substring(5);
-    args.trim();
-    int sp = args.indexOf(' ');
-    if (sp < 0) {
-      Serial.println("Usage: goto N <0..1>");
+    String posTok = argToken(args, 1);
+    if (posTok.length() == 0) {
+      Serial.println("Usage: goto N <0..1> [speed rad/s]");
     } else {
-      int n = args.substring(0, sp).toInt();
-      float pos = args.substring(sp + 1).toFloat();
+      int n = argToken(args, 0).toInt();
+      float pos = posTok.toFloat();
+      float speed = argToken(args, 2).toFloat();
       if (n < 1 || n > NUM_MOTORS) {
-        Serial.println("Usage: goto N <0..1>");
+        Serial.println("Usage: goto N <0..1> [speed rad/s]");
       } else if (!calibrated[n - 1]) {
         Serial.println("motor not calibrated — set min and max first");
       } else {
         int i = n - 1;
         pos = _constrain(pos, 0.0f, 1.0f);
-        startPosition(i, angleMin[i] + pos * (angleMax[i] - angleMin[i]), false);
+        speed = (speed > 0.0f) ? clampSpeed(speed) : MAX_VELOCITY;
+        startPosition(i, angleMin[i] + pos * (angleMax[i] - angleMin[i]), false, speed);
       }
     }
   } else if (cmd.startsWith("hold ")) {
     int n = motorArg(cmd, 5);
     if (n >= 1 && n <= NUM_MOTORS) {
       updateContinuousAngle(n - 1);
-      startPosition(n - 1, motorAngle(n - 1), true);
+      startPosition(n - 1, motorAngle(n - 1), true, MAX_VELOCITY);
     } else Serial.println("Usage: hold N");
   } else if (cmd.startsWith("torque ")) {
     String args = cmd.substring(7);

@@ -25,11 +25,23 @@ These commands already exist; keep them reliable (USB Serial + BLE, `\n`-termina
 |---------|-----------|
 | `min` / `max` | Mark **current pose** as min/max for **all** motors |
 | `min N` / `max N` | Same for device motor **N** only |
-| `fwd N [seconds]` | Velocity jog forward (default ~2 s) |
-| `rev N [seconds]` | Velocity jog reverse |
+| `fwd N [seconds] [speed]` | Velocity jog forward (default ~2 s at 2 rad/s) |
+| `rev N [seconds] [speed]` | Velocity jog reverse |
 | `idle` / `idle N` | Stop / coast |
 | `hold N` | Hold current angle |
-| **`goto N <0..1>`** | Move to calibrated fraction of travel |
+| **`goto N <0..1> [speed]`** | Move to calibrated fraction of travel (default 3 rad/s) |
+
+### Optional speed argument
+
+- `speed` is motor-shaft **rad/s**, always positive; direction comes from `fwd`/`rev` or the `goto` target.
+- Omitted, zero, or negative → the default (2 rad/s for `fwd`/`rev`, 3 rad/s for `goto`), so existing commands are unchanged.
+- Clamped to **0.1..10 rad/s**; firmware prints `speed clamped to …` when it clamps.
+- Arguments are positional: to give a jog speed you must also give seconds, e.g. `fwd 3 2 5`.
+- `hold` always uses the full default recovery speed regardless of any earlier `goto` speed.
+- Torque drops as speed rises (back-EMF on the 12 V bus): roughly 95% of stall force at 5 rad/s, 82% at 10 rad/s.
+- `goto` follows a smooth trapezoidal profile (20 rad/s² accel/decel) at the requested speed, so start and stop are gentle rather than abrupt.
+- Closed-loop `fwd`/`rev` ramp up at the same rate and track a moving angle reference, so they hold speed more steadily. They still coast immediately when the jog time ends or a soft endstop is hit.
+- The `goto` timeout scales with distance and speed (minimum 10 s), capped just under the 15 s energise backstop; extremely slow moves over a long span can still stop short.
 
 ### `goto` (critical)
 
@@ -135,3 +147,5 @@ Device `demo` (goto min then max per calibrated motor) may remain as a smoke tes
    the previously stored end.
 7. `cal clear` → all five motors uncalibrated.
 8. Power cycle → ends cleared (`nan`) until re-marked (document RAM-only).
+9. `goto 5 0 1` then `goto 5 1 6` → slow move then visibly faster move; log lines show `speed=1.00rad/s` and `speed=6.00rad/s`.
+10. `fwd 5 1 20` → prints `speed clamped to 10.00rad/s`.
